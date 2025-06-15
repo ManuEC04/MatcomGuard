@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include "funcionalidades/usbscanner.h"
 #include "funcionalidades/process_scanner.h"
+#include "funcionalidades/port_scanner.h"
 
 int main() {
     int opcion;
@@ -25,7 +26,7 @@ int main() {
                 process_scan();
                 break;
             case 3:
-                printf("Funcionalidad aún no implementada.\n");
+                port_scan();
                 break;
             case 0:
                 printf("Saliendo de MATCOM GUARD...\n");
