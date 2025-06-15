@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include "funcionalidades/usbscanner.h"
+#include "funcionalidades/process_scanner.h"
 
 int main() {
     int opcion;
@@ -21,7 +22,7 @@ int main() {
                 usb_scan();
                 break;
             case 2:
-                printf("Funcionalidad aún no implementada.\n");
+                process_scan();
                 break;
             case 3:
                 printf("Funcionalidad aún no implementada.\n");
