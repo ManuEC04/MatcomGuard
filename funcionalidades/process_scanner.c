@@ -1,212 +1,188 @@
-#include "process_scanner.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <dirent.h>
 #include <ctype.h>
 #include <unistd.h>
+#include <pthread.h>
 #include <termios.h>
 #include <fcntl.h>
-#include <time.h>
+#include <signal.h>
 
-#define CPU_THRESHOLD 50.0   // % de CPU
-#define MEM_THRESHOLD 50.0   // % de memoria
-#define ALERT_SECONDS 10
+#define CPU_THRESHOLD 80.0
+#define MEM_THRESHOLD 30.0
+#define ALERT_SECONDS 15
 #define MAX_PROCESSES 4096
 
 typedef struct {
     int pid;
     char name[256];
-    double cpu_usage;
-    double mem_usage;
-    int over_threshold_seconds;
-    int alerted;
-} ProcessAlertInfo;
+    unsigned long prev_total;
+    int cpu_consec;
+    int mem_consec;
+} ProcInfo;
 
-typedef struct {
-    int pid;
-    char name[256];
-    unsigned long utime;
-    unsigned long stime;
-    unsigned long vsize;
-    unsigned long rss;
-    double cpu_usage;
-    double mem_usage;
-} ProcessInfo;
+volatile sig_atomic_t running = 1;
 
-// Configura la terminal para lectura no bloqueante
-static void set_nonblocking(int enable) {
-    static struct termios oldt, newt;
-    static int oldf;
-    if (enable) {
-        tcgetattr(STDIN_FILENO, &oldt);
-        newt = oldt;
-        newt.c_lflag &= ~(ICANON | ECHO);
-        tcsetattr(STDIN_FILENO, TCSANOW, &newt);
-        oldf = fcntl(STDIN_FILENO, F_GETFL, 0);
-        fcntl(STDIN_FILENO, F_SETFL, oldf | O_NONBLOCK);
-    } else {
-        tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
-        fcntl(STDIN_FILENO, F_SETFL, oldf);
+// Thread que detecta si se presiona 'q'
+void *key_listener(void *arg) {
+    struct termios oldt, newt;
+    tcgetattr(STDIN_FILENO, &oldt);
+    newt = oldt;
+    newt.c_lflag &= ~(ICANON | ECHO);
+    tcsetattr(STDIN_FILENO, TCSANOW, &newt);
+
+    int ch;
+    while (running) {
+        ch = getchar();
+        if (ch == 'q' || ch == 'Q') {
+            running = 0;
+            break;
+        }
+        usleep(100000);
     }
+
+    tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
+    return NULL;
 }
 
-static unsigned long get_total_cpu_time() {
-    FILE *fp = fopen("/proc/stat", "r");
-    if (!fp) return 0;
-    char line[512];
-    unsigned long user, nice, system, idle, iowait, irq, softirq, steal;
-    fgets(line, sizeof(line), fp);
-    sscanf(line, "cpu %lu %lu %lu %lu %lu %lu %lu %lu",
-           &user, &nice, &system, &idle, &iowait, &irq, &softirq, &steal);
-    fclose(fp);
-    return user + nice + system + idle + iowait + irq + softirq + steal;
-}
-
-static unsigned long get_total_mem() {
-    FILE *fp = fopen("/proc/meminfo", "r");
-    if (!fp) return 0;
-    char line[256];
-    unsigned long mem_total = 0;
-    while (fgets(line, sizeof(line), fp)) {
-        if (sscanf(line, "MemTotal: %lu kB", &mem_total) == 1) break;
-    }
-    fclose(fp);
-    return mem_total;
-}
-
-static int is_number(const char *str) {
-    while (*str) {
-        if (!isdigit(*str)) return 0;
-        str++;
-    }
+// Verifica si una cadena es numérica
+int isnum(const char *s) {
+    while (*s) { if (!isdigit(*s++)) return 0; }
     return 1;
 }
 
-static void scan_processes(unsigned long cpu_diff, unsigned long total_mem, ProcessAlertInfo *alerts, int *alert_count) {
-    DIR *dir = opendir("/proc");
-    struct dirent *entry;
+// Lee tiempo de CPU y nombre de un proceso
+int read_stat(int pid, unsigned long *t, char *name) {
+    char buf[1024], path[64];
+    snprintf(path, sizeof(path), "/proc/%d/stat", pid);
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    if (!fgets(buf, sizeof(buf), f)) { fclose(f); return 0; }
+    fclose(f);
 
-    if (!dir) {
-        perror("opendir /proc");
-        return;
-    }
+    char *s = strchr(buf, '('), *e = strrchr(buf, ')');
+    if (!s || !e) return 0;
 
-    printf("%-8s %-25s %-10s %-10s\n", "PID", "NAME", "CPU(%)", "MEM(%)");
+    size_t len = e - s - 1;
+    strncpy(name, s + 1, len);
+    name[len] = '\0';
 
-    while ((entry = readdir(dir)) != NULL) {
-        if (!is_number(entry->d_name)) continue;
-        int pid = atoi(entry->d_name);
-        char stat_path[256];
-        snprintf(stat_path, sizeof(stat_path), "/proc/%d/stat", pid);
+    unsigned long ut, st;
+    if (sscanf(e + 2, "%*c %*d %*d %*d %*d %*u %*u %*u %*u %*u %lu %lu",
+               &ut, &st) != 2)
+        return 0;
 
-        FILE *fp = fopen(stat_path, "r");
-        if (!fp) continue;
-
-        ProcessInfo pinfo = {0};
-        pinfo.pid = pid;
-
-        char comm[256];
-        char state;
-        unsigned long utime, stime, vsize;
-        long rss;
-        int scanned = fscanf(fp, "%d %255s %c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %lu %lu %*d %*d %*d %*d %*d %*d %*u %lu %ld",
-                             &pinfo.pid, comm, &state, &utime, &stime, &vsize, &rss);
-        fclose(fp);
-        if (scanned < 7) continue;
-
-        strncpy(pinfo.name, comm, sizeof(pinfo.name));
-        pinfo.utime = utime;
-        pinfo.stime = stime;
-        pinfo.vsize = vsize;
-        pinfo.rss = rss;
-
-        // Calcular uso de memoria
-        pinfo.mem_usage = (double)(rss * sysconf(_SC_PAGESIZE)) / (total_mem * 1024) * 100.0;
-
-        // Calcular uso de CPU (simplificado, solo para ejemplo)
-        pinfo.cpu_usage = ((double)(utime + stime) / cpu_diff) * 100.0;
-
-        // Buscar si el proceso ya está en la lista de alertas
-        int found = 0;
-        for (int i = 0; i < *alert_count; ++i) {
-            if (alerts[i].pid == pinfo.pid) {
-                found = 1;
-                // Si sigue sobre el umbral, incrementar el contador
-                if (pinfo.cpu_usage > CPU_THRESHOLD && pinfo.mem_usage > MEM_THRESHOLD) {
-                    alerts[i].over_threshold_seconds++;
-                } else {
-                    alerts[i].over_threshold_seconds = 0;
-                    alerts[i].alerted = 0;
-                }
-                alerts[i].cpu_usage = pinfo.cpu_usage;
-                alerts[i].mem_usage = pinfo.mem_usage;
-                strncpy(alerts[i].name, pinfo.name, sizeof(alerts[i].name));
-                break;
-            }
-        }
-        // Si no está, agregarlo si corresponde
-        if (!found && *alert_count < MAX_PROCESSES) {
-            alerts[*alert_count].pid = pinfo.pid;
-            strncpy(alerts[*alert_count].name, pinfo.name, sizeof(alerts[*alert_count].name));
-            alerts[*alert_count].cpu_usage = pinfo.cpu_usage;
-            alerts[*alert_count].mem_usage = pinfo.mem_usage;
-            if (pinfo.cpu_usage > CPU_THRESHOLD && pinfo.mem_usage > MEM_THRESHOLD) {
-                alerts[*alert_count].over_threshold_seconds = 1;
-            } else {
-                alerts[*alert_count].over_threshold_seconds = 0;
-            }
-            alerts[*alert_count].alerted = 0;
-            (*alert_count)++;
-        }
-
-        // Mostrar información y alerta si corresponde
-        int alert_this = 0;
-        for (int i = 0; i < *alert_count; ++i) {
-            if (alerts[i].pid == pinfo.pid &&
-                alerts[i].over_threshold_seconds * 0.5 >= ALERT_SECONDS && // 0.5s por ciclo
-                !alerts[i].alerted) {
-                alert_this = 1;
-                alerts[i].alerted = 1;
-                break;
-            }
-        }
-
-        if (alert_this) {
-            printf("%-8d %-25s %-10.2f %-10.2f <-- ALERTA: >50%% CPU y RAM por más de 10s\n",
-                   pinfo.pid, pinfo.name, pinfo.cpu_usage, pinfo.mem_usage);
-        } else if (pinfo.cpu_usage > CPU_THRESHOLD || pinfo.mem_usage > MEM_THRESHOLD) {
-            printf("%-8d %-25s %-10.2f %-10.2f <-- Sobre umbral\n",
-                   pinfo.pid, pinfo.name, pinfo.cpu_usage, pinfo.mem_usage);
-        } else {
-            printf("%-8d %-25s %-10.2f %-10.2f\n",
-                   pinfo.pid, pinfo.name, pinfo.cpu_usage, pinfo.mem_usage);
-        }
-    }
-    closedir(dir);
+    *t = ut + st;
+    return 1;
 }
 
-void process_scan() {
-    set_nonblocking(1);
-    printf("Monitoreando procesos en tiempo real. Presione Q para salir.\n");
-    ProcessAlertInfo alerts[MAX_PROCESSES] = {0};
-    int alert_count = 0;
-    int quit = 0;
-    while (!quit) {
-        unsigned long total_mem = get_total_mem();
-        unsigned long total_cpu_1 = get_total_cpu_time();
-        usleep(500000); // 0.5 segundos
-        unsigned long total_cpu_2 = get_total_cpu_time();
-        unsigned long cpu_diff = total_cpu_2 - total_cpu_1;
-
-        printf("\033[2J\033[H"); // Limpiar pantalla
-        scan_processes(cpu_diff, total_mem, alerts, &alert_count);
-
-        // Verificar si se presionó 'q' o 'Q'
-        int c = getchar();
-        if (c == 'q' || c == 'Q') {
-            quit = 1;
-        }
+// Calcula porcentaje de RAM usada por un proceso
+double get_process_mem_percent(int pid, unsigned long total_kb) {
+    char path[64], line[256];
+    snprintf(path, sizeof(path), "/proc/%d/status", pid);
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    unsigned long vmrss_kb = 0;
+    while (fgets(line, sizeof(line), f)) {
+        if (sscanf(line, "VmRSS: %lu kB", &vmrss_kb) == 1) break;
     }
-    set_nonblocking(0);
+    fclose(f);
+    return (double)vmrss_kb / total_kb * 100.0;
+}
+
+// Función principal llamada externamente
+void process_scan() {
+    running = 1;  // reinicia el estado para permitir nuevas ejecuciones
+
+    ProcInfo arr[MAX_PROCESSES];
+    int n = 0;
+    long clk = sysconf(_SC_CLK_TCK);
+    unsigned long total_mem_kb = 0;
+
+    // Obtener memoria total
+    {
+        FILE *f = fopen("/proc/meminfo", "r");
+        char line[256];
+        while (fgets(line, sizeof(line), f)) {
+            if (sscanf(line, "MemTotal: %lu kB", &total_mem_kb) == 1)
+                break;
+        }
+        fclose(f);
+    }
+
+    // Lanzar hilo que escucha la tecla 'q'
+    pthread_t key_thread;
+    pthread_create(&key_thread, NULL, key_listener, NULL);
+
+    printf("🔍 Monitoreo iniciado: Presione 'q' para finalizar ejecución\n");
+
+    while (running) {
+        sleep(1);
+        DIR *d = opendir("/proc");
+        if (!d) {
+            perror("opendir");
+            return;
+        }
+
+        struct dirent *e;
+        while ((e = readdir(d))) {
+            if (!isnum(e->d_name)) continue;
+
+            int pid = atoi(e->d_name);
+            unsigned long total;
+            char name[256];
+            if (!read_stat(pid, &total, name)) continue;
+
+            double mem = get_process_mem_percent(pid, total_mem_kb);
+
+            // Buscar si el proceso ya existe en la lista
+            int i;
+            for (i = 0; i < n; i++)
+                if (arr[i].pid == pid) break;
+
+            // Si no existe, agregarlo
+            if (i == n && n < MAX_PROCESSES) {
+                arr[n].pid = pid;
+                strcpy(arr[n].name, name);
+                arr[n].prev_total = total;
+                arr[n].cpu_consec = 0;
+                arr[n].mem_consec = (mem > MEM_THRESHOLD) ? 1 : 0;
+                n++;
+            }
+
+            if (i == n) continue;  // ya no hay espacio
+
+            unsigned long diff = total - arr[i].prev_total;
+            arr[i].prev_total = total;
+            double cpu = ((double)diff / clk) * 100.0;
+
+            // Comprobar umbral de CPU
+            if (cpu > CPU_THRESHOLD) {
+                arr[i].cpu_consec++;
+                if (arr[i].cpu_consec == ALERT_SECONDS) {
+                    printf("🚨 ALERTA CPU: PID %d (%s) uso > %.1f%% CPU durante %d segundos consecutivos\n",
+                           pid, name, CPU_THRESHOLD, ALERT_SECONDS);
+                }
+            } else {
+                arr[i].cpu_consec = 0;
+            }
+
+            // Comprobar umbral de RAM
+            if (mem > MEM_THRESHOLD) {
+                arr[i].mem_consec++;
+                if (arr[i].mem_consec == ALERT_SECONDS) {
+                    printf("🚨 ALERTA MEMORIA: PID %d (%s) uso > %.1f%% MEM durante %d segundos consecutivos\n",
+                           pid, name, MEM_THRESHOLD, ALERT_SECONDS);
+                }
+            } else {
+                arr[i].mem_consec = 0;
+            }
+        }
+
+        closedir(d);
+    }
+
+    pthread_join(key_thread, NULL);
+    printf("\n✅ Monitoreo finalizado por el usuario (tecla 'q')\n");
 }
